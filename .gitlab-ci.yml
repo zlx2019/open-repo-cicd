@@ -1,0 +1,246 @@
+# =====================================================================
+# GitLab CI/CD：Rust 校验 → 同步到 GitHub（orphan）→ tag 与 Release 发布
+# ---------------------------------------------------------------------
+# 触发场景：
+#   • push 到任意分支 / MR              → rust:check
+#   • push 到 默认分支（如 main）        → rust:check → sync:github（orphan）
+#   • push 形如 vX.Y.Z 的 tag           → rust:check → build:release
+#                                          → sync:github（orphan + tag）
+#                                          → release:github（创建 Release，附二进制）
+# ---------------------------------------------------------------------
+# 需要在 GitLab 配置的 CI 变量：
+#   GITHUB_USERNAME  GitHub 用户名
+#   GITHUB_TOKEN     PAT（Fine-grained: Contents=R/W；或 classic: repo）
+#   GITHUB_REPO      目标公开仓库，如 "your-name/open-repo-public"
+#   GITHUB_BRANCH    （可选）目标分支，默认 main
+#
+# 发布一个版本的流程：
+#   git tag v0.1.0 && git push origin v0.1.0
+# =====================================================================
+
+stages:
+  - check
+  - build
+  - sync
+  - release
+
+variables:
+  CARGO_TERM_COLOR: always
+  CARGO_HOME: "$CI_PROJECT_DIR/.cargo"
+  RUST_BACKTRACE: "1"
+  BIN_NAME: "open-repo-cicd"
+  # 发布产物的目标三元组（如需多平台，改成 matrix）
+  RUST_TARGET: "x86_64-unknown-linux-gnu"
+
+# ---- 公共缓存定义（隐藏 job，通过 extends 复用） ----
+.cargo-cache:
+  cache:
+    key:
+      files:
+        - Cargo.lock
+      prefix: "rust"
+    paths:
+      - .cargo/registry/index/
+      - .cargo/registry/cache/
+      - .cargo/git/db/
+      - target/
+
+# ========================== 1) 基础校验 ==========================
+rust:check:
+  stage: check
+  image: rust:1-bookworm
+  extends: .cargo-cache
+  before_script:
+    - rustc --version && cargo --version
+    - rustup component add rustfmt clippy
+  script:
+    - cargo fmt --all -- --check
+    - cargo check --all-targets --locked
+    - cargo clippy --all-targets --all-features --locked -- -D warnings
+    - cargo test --all --locked
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_TAG'
+    - if: '$CI_COMMIT_BRANCH'
+
+# ========================== 2) 构建 release 二进制（仅 tag） ==========================
+build:release:
+  stage: build
+  image: rust:1-bookworm
+  extends: .cargo-cache
+  needs:
+    - job: rust:check
+      artifacts: false
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+([-+].+)?$/'
+  script:
+    - cargo build --release --locked
+    - mkdir -p dist
+    - cp "target/release/${BIN_NAME}" "dist/${BIN_NAME}-${CI_COMMIT_TAG}-${RUST_TARGET}"
+    - cd dist
+    - tar -czf "${BIN_NAME}-${CI_COMMIT_TAG}-${RUST_TARGET}.tar.gz" "${BIN_NAME}-${CI_COMMIT_TAG}-${RUST_TARGET}"
+    - sha256sum "${BIN_NAME}-${CI_COMMIT_TAG}-${RUST_TARGET}" "${BIN_NAME}-${CI_COMMIT_TAG}-${RUST_TARGET}.tar.gz" > SHA256SUMS
+    - ls -lh
+  artifacts:
+    name: "${BIN_NAME}-${CI_COMMIT_TAG}-artifacts"
+    paths:
+      - dist/
+    expire_in: 30 days
+
+# ========================== 3) 同步到 GitHub（orphan + 可选 tag） ==========================
+sync:github:
+  stage: sync
+  image: alpine:3.20
+  needs:
+    - job: rust:check
+      artifacts: false
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+([-+].+)?$/'
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+  variables:
+    GIT_STRATEGY: clone
+    GIT_DEPTH: "1"
+  before_script:
+    - apk add --no-cache git ca-certificates
+  script:
+    - |
+      set -eu
+
+      [ -n "${GITHUB_USERNAME:-}" ] || { echo "missing CI var: GITHUB_USERNAME"; exit 1; }
+      [ -n "${GITHUB_TOKEN:-}"    ] || { echo "missing CI var: GITHUB_TOKEN";    exit 1; }
+      [ -n "${GITHUB_REPO:-}"     ] || { echo "missing CI var: GITHUB_REPO";     exit 1; }
+      : "${GITHUB_BRANCH:=main}"
+
+      # commit author：默认用 GITHUB_USERNAME；邮箱默认走 GitHub noreply（这样 GitHub
+      # 会自动把提交关联到该账号并显示头像）。可通过 CI 变量 GIT_USER_NAME/GIT_USER_EMAIL 覆盖。
+      git config --global user.name  "${GIT_USER_NAME:-${GITHUB_USERNAME}}"
+      git config --global user.email "${GIT_USER_EMAIL:-${GITHUB_USERNAME}@users.noreply.github.com}"
+      git config --global init.defaultBranch "${GITHUB_BRANCH}"
+
+      # commit message：tag 触发用 "release: vX.Y.Z"；普通 push 透传 GitLab 原 commit 信息
+      MSG_FILE="$(mktemp)"
+      if [ -n "${CI_COMMIT_TAG:-}" ]; then
+        printf 'release: %s\n' "$CI_COMMIT_TAG" > "$MSG_FILE"
+      elif [ -n "${CI_COMMIT_MESSAGE:-}" ]; then
+        printf '%s' "$CI_COMMIT_MESSAGE" > "$MSG_FILE"
+      else
+        printf 'chore: sync %s@%s\n' "$CI_PROJECT_PATH" "$CI_COMMIT_SHORT_SHA" > "$MSG_FILE"
+      fi
+
+      # 创建孤立分支，只包含当前工作区快照
+      git checkout --orphan __sync_orphan
+      git reset
+      git add -A
+      git commit -F "$MSG_FILE"
+
+      REMOTE_URL="https://${GITHUB_USERNAME}:${GITHUB_TOKEN}@github.com/${GITHUB_REPO}.git"
+      git remote remove github 2>/dev/null || true
+      git remote add github "$REMOTE_URL"
+
+      echo ">>> push orphan snapshot to github.com/${GITHUB_REPO}:${GITHUB_BRANCH}"
+      git push --force github "HEAD:refs/heads/${GITHUB_BRANCH}"
+
+      if [ -n "${CI_COMMIT_TAG:-}" ]; then
+        echo ">>> push tag ${CI_COMMIT_TAG}"
+        git tag -f "${CI_COMMIT_TAG}"
+        git push --force github "refs/tags/${CI_COMMIT_TAG}"
+      fi
+
+      echo "Sync done."
+
+# ========================== 4) 发布 GitHub Release（仅 tag） ==========================
+release:github:
+  stage: release
+  image: alpine:3.20
+  needs:
+    - job: sync:github
+      artifacts: false
+    - job: build:release
+      artifacts: true
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+([-+].+)?$/'
+  variables:
+    GIT_STRATEGY: clone
+    GIT_DEPTH: "0"     # 需要完整历史以生成 changelog
+  before_script:
+    - apk add --no-cache curl jq git ca-certificates
+  script:
+    - |
+      set -eu
+
+      [ -n "${GITHUB_TOKEN:-}" ] || { echo "missing CI var: GITHUB_TOKEN"; exit 1; }
+      [ -n "${GITHUB_REPO:-}"  ] || { echo "missing CI var: GITHUB_REPO";  exit 1; }
+
+      # ----- 生成 changelog（上一个 v* tag → 当前 tag） -----
+      PREV_TAG=$(git describe --tags --abbrev=0 --match 'v[0-9]*.[0-9]*.[0-9]*' "${CI_COMMIT_TAG}^" 2>/dev/null || true)
+      if [ -n "$PREV_TAG" ]; then
+        RANGE="${PREV_TAG}..${CI_COMMIT_TAG}"
+        HEADER="### Changes since ${PREV_TAG}"
+      else
+        RANGE="${CI_COMMIT_TAG}"
+        HEADER="### Initial release"
+      fi
+
+      {
+        echo "$HEADER"
+        echo
+        git log --no-merges --pretty=format:'- %s (%h)' "$RANGE" || true
+        echo
+        echo
+        echo "**Source commit:** \`${CI_COMMIT_SHORT_SHA}\`"
+        echo
+        if [ -f dist/SHA256SUMS ]; then
+          echo "### SHA256"
+          echo
+          echo '```'
+          cat dist/SHA256SUMS
+          echo '```'
+        fi
+      } > RELEASE_NOTES.md
+
+      echo "----- RELEASE_NOTES.md -----"
+      cat RELEASE_NOTES.md
+      echo "----------------------------"
+
+      # ----- 调 GitHub API 创建（或重建）Release -----
+      API="https://api.github.com/repos/${GITHUB_REPO}"
+      AUTH="Authorization: Bearer ${GITHUB_TOKEN}"
+      ACCEPT="Accept: application/vnd.github+json"
+      APIVER="X-GitHub-Api-Version: 2022-11-28"
+
+      # 幂等：若同名 release 已存在则删除（避免重跑 pipeline 时冲突）
+      EXIST=$(curl -fsSL -H "$AUTH" -H "$ACCEPT" "${API}/releases/tags/${CI_COMMIT_TAG}" || true)
+      EXIST_ID=$(echo "$EXIST" | jq -r '.id // empty')
+      if [ -n "$EXIST_ID" ]; then
+        echo ">>> existing release id=${EXIST_ID}, deleting..."
+        curl -fsSL -X DELETE -H "$AUTH" -H "$ACCEPT" "${API}/releases/${EXIST_ID}"
+      fi
+
+      PAYLOAD=$(jq -nc \
+        --arg tag  "$CI_COMMIT_TAG" \
+        --arg name "$CI_COMMIT_TAG" \
+        --rawfile body RELEASE_NOTES.md \
+        '{tag_name:$tag, name:$name, body:$body, draft:false, prerelease:false}')
+
+      echo ">>> creating release ${CI_COMMIT_TAG}"
+      RESP=$(curl -fsSL -X POST -H "$AUTH" -H "$ACCEPT" -H "$APIVER" \
+        "${API}/releases" -d "$PAYLOAD")
+
+      UPLOAD_URL=$(echo "$RESP" | jq -r '.upload_url' | sed 's/{.*}//')
+      echo "upload_url=${UPLOAD_URL}"
+
+      # ----- 上传产物 -----
+      if [ -d dist ]; then
+        for f in dist/*; do
+          [ -e "$f" ] || continue
+          name=$(basename "$f")
+          echo ">>> uploading asset ${name}"
+          curl -fsSL -X POST \
+            -H "$AUTH" -H "$ACCEPT" \
+            -H "Content-Type: application/octet-stream" \
+            --data-binary @"$f" \
+            "${UPLOAD_URL}?name=${name}" >/dev/null
+        done
+      fi
+
+      echo "Released: https://github.com/${GITHUB_REPO}/releases/tag/${CI_COMMIT_TAG}"

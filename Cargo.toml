@@ -1,0 +1,6 @@
+[package]
+name = "open-repo-cicd"
+version = "0.1.1"
+edition = "2024"
+
+[dependencies]
